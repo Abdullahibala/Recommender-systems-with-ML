@@ -1,0 +1,135 @@
+import os
+import json
+import argparse
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import mean_absolute_error
+from tqdm import tqdm
+
+# -----------------------------
+# Step 1: Argument Parsing
+# -----------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--data_dir", required=True, help="Path to the movie dataset directory")
+parser.add_argument("--min_ratings", type=int, default=20, help="Minimum number of ratings per user")
+parser.add_argument("--sample_users", type=int, default=500, help="Limit number of users for testing")
+parser.add_argument("--test_size", type=float, default=0.2, help="Fraction of test set")
+parser.add_argument("--top_n", type=int, default=5, help="Top-N recommendations")
+parser.add_argument("--seed", type=int, default=42)
+args = parser.parse_args()
+
+np.random.seed(args.seed)
+
+# -----------------------------
+# Step 2: Load Movie-Tag Scores
+# -----------------------------
+scores_path = os.path.join(args.data_dir, "scores", "glmer.csv")
+print(f"\nReading scores from: {scores_path}")
+
+scores = pd.read_csv(scores_path)
+content_matrix = scores.pivot(index="item_id", columns="tag", values="score").fillna(0)
+print(f"Movies with content vectors: {content_matrix.shape[0]} tags: {content_matrix.shape[1]}")
+
+# -----------------------------
+# Step 3: Stream Ratings File
+# -----------------------------
+ratings_path = os.path.join(args.data_dir, "raw", "ratings.json")
+
+print("Counting ratings per user (streaming ratings.json)...")
+user_counts = {}
+with open(ratings_path, "r", encoding="utf-8") as f:
+    for line in tqdm(f, desc="Counting"):
+        r = json.loads(line)
+        user = r["user_id"]
+        user_counts[user] = user_counts.get(user, 0) + 1
+
+active_users = [u for u, c in user_counts.items() if c >= args.min_ratings]
+np.random.shuffle(active_users)
+if args.sample_users and len(active_users) > args.sample_users:
+    active_users = active_users[:args.sample_users]
+
+print(f"Active users (>= {args.min_ratings} ratings): {len(active_users)}")
+
+# -----------------------------
+# Step 4: Load Filtered Ratings
+# -----------------------------
+filtered = []
+with open(ratings_path, "r", encoding="utf-8") as f:
+    for line in tqdm(f, desc="Filtering"):
+        r = json.loads(line)
+        if r["user_id"] in active_users:
+            filtered.append((r["user_id"], r["item_id"], r["rating"]))
+
+ratings_df = pd.DataFrame(filtered, columns=["user_id", "item_id", "rating"])
+ratings_df = ratings_df[ratings_df["item_id"].isin(content_matrix.index)]
+print(f"Filtered ratings: {ratings_df.shape}")
+
+# -----------------------------
+# Step 5: Train/Test Split
+# -----------------------------
+from sklearn.model_selection import train_test_split
+train_df, test_df = train_test_split(ratings_df, test_size=args.test_size, random_state=args.seed)
+print(f"Train: {train_df.shape}, Test: {test_df.shape}")
+
+# -----------------------------
+# Step 6: Build User Profiles
+# -----------------------------
+def build_user_profile(user_id, ratings_df, content_matrix):
+    user_ratings = ratings_df[ratings_df["user_id"] == user_id]
+    user_content = content_matrix.loc[user_ratings["item_id"]]
+    weights = user_ratings["rating"].values.reshape(-1, 1)
+    profile = np.average(user_content, axis=0, weights=weights.flatten())
+    return profile
+
+user_profiles = {}
+for u in tqdm(active_users, desc="Building user profiles"):
+    user_profiles[u] = build_user_profile(u, train_df, content_matrix)
+
+# -----------------------------
+# Step 7: Predict Ratings
+# -----------------------------
+def predict_rating(user_id, item_id):
+    if user_id not in user_profiles or item_id not in content_matrix.index:
+        return np.nan
+    sim = cosine_similarity(
+        user_profiles[user_id].reshape(1, -1),
+        content_matrix.loc[item_id].values.reshape(1, -1)
+    )[0, 0]
+    return sim * 5  # scale back to 0–5 range
+
+print("\nPredicting test ratings...")
+test_df["predicted"] = [
+    predict_rating(u, i) for u, i in tqdm(zip(test_df["user_id"], test_df["item_id"]), total=len(test_df))
+]
+
+mae = mean_absolute_error(test_df["rating"], test_df["predicted"])
+print(f"\n✅ Mean Absolute Error (MAE): {mae:.4f}")
+
+# -----------------------------
+# Step 8: Evaluate Top-N Recommendations
+# -----------------------------
+def get_top_n_recommendations(user_id, n=5):
+    user_seen = set(train_df[train_df["user_id"] == user_id]["item_id"])
+    candidates = [m for m in content_matrix.index if m not in user_seen]
+    sims = [
+        (m, cosine_similarity(user_profiles[user_id].reshape(1, -1), content_matrix.loc[m].values.reshape(1, -1))[0, 0])
+        for m in candidates
+    ]
+    sims.sort(key=lambda x: x[1], reverse=True)
+    return [m for m, _ in sims[:n]]
+
+print("\nEvaluating Top-N hit ratio...")
+hits = 0
+users_evaluated = 0
+for u in tqdm(active_users, desc="Top-N Evaluation"):
+    true_items = set(test_df[test_df["user_id"] == u]["item_id"])
+    if not true_items:
+        continue
+    recommended = get_top_n_recommendations(u, args.top_n)
+    if any(item in recommended for item in true_items):
+        hits += 1
+    users_evaluated += 1
+
+hit_ratio = hits / users_evaluated if users_evaluated else 0
+print(f"✅ Hit Ratio (Top-{args.top_n}): {hit_ratio:.4f}")
